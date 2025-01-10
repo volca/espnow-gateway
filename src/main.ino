@@ -23,59 +23,80 @@
 #include "WiFi.h"
 #include "ETH.h"
 #include <ArduinoQueue.h>
+#include <ArduinoJson.h>
 #include <ArduinoMqttClient.h>
 
 #include <esp_mac.h>  // For the MAC2STR and MACSTR macros
 
 #include <vector>
+#include <map>
+#include "bthome_base_common.h"
+#include <bthome_parser.h>
+
+/* Definitions */
 
 #define MQTTTopicLength		128
 #define MQTTDataLength		256
 #define MQTTQueueMaxElem  10
 #define MACIDSTRINGLENGTH 18
 
+#define ESPNOW_WIFI_CHANNEL 1
+
+using namespace bthome_base;
+
 struct QueueElem_t
 {
-	char Topic[MQTTTopicLength];
-  char MacID[MACIDSTRINGLENGTH];
+    char MacID[MACIDSTRINGLENGTH];
 	char Data[MQTTDataLength];
+    size_t DataLen;
 };
 
-/* Definitions */
-
-#define ESPNOW_WIFI_CHANNEL 1
+struct SensorInfo {
+  char mac[MACIDSTRINGLENGTH];
+  bool initialized;
+  uint8_t type;
+};
 
 WiFiClient ethClient;
 MqttClient mqttClient(ethClient);
 
-static bool eth_connected = false;
-static bool isStartupComplete = false;
+bool eth_connected = false;
+char currentSensorMac[MACIDSTRINGLENGTH];
+
+std::map<String, uint8_t> sensors;
 
 ArduinoQueue<QueueElem_t> DataQueue(MQTTQueueMaxElem);
 // To be filled by the user, please visit: https://www.hivemq.com/demos/websocket-client/
 const char MQTT_BROKER_PATH[] = "192.168.31.20";
 int        MQTT_BROKER_PORT   = 1883;
-const char MQTT_PUBLISH_TOPIC[]  = "WT32-ETH01/espNowEndpoint";
 const char MQTT_CLIENT_ID[] = "clientId-tPbkEIA7IS";
 
+void printHex(uint8_t *data, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        if (data[i] < 0x10) {
+            Serial.print("0"); // 补零
+        }
+        Serial.print(data[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
+}
 
-bool InsertElemInQueue(char* MQTTTopic, char* MacID, char *data, int data_len)
+bool InsertElemInQueue(char* MacID, char *data, int data_len)
 {
   QueueElem_t QueueItem;
   memset(&QueueItem, 0x00, sizeof(QueueItem));
 
   Serial.println("Putting Element In Queue.......");
   Serial.println();
-  memcpy(QueueItem.Topic, MQTTTopic, strlen(MQTTTopic));
   memcpy(QueueItem.MacID, MacID, strlen(MacID));
   memcpy(QueueItem.Data, data, data_len);
+  QueueItem.DataLen = data_len;
   
   DataQueue.enqueue(QueueItem);
 
   Serial.println("Successfully");
-  Serial.print("Topic: "); Serial.println(QueueItem.Topic);
   Serial.print("MacID: "); Serial.println(QueueItem.MacID);
-  Serial.print("Data: "); Serial.println(QueueItem.Data);
   Serial.println();
 
   return true;
@@ -105,8 +126,10 @@ public:
   // Function to print the received messages from the master
   void onReceive(const uint8_t *data, size_t len, bool broadcast) {
     Serial.printf("Received a message from master " MACSTR " (%s)\n", MAC2STR(addr()), broadcast ? "broadcast" : "unicast");
-    Serial.printf("  Message: %s\n", (char *)data);
-    InsertElemInQueue((char*)MQTT_PUBLISH_TOPIC, "<test-mac>", (char*)data, len);
+    char mac[20];
+    sprintf(mac, MACSTR, MAC2STR(addr()));
+    // TODO
+    InsertElemInQueue(mac, (char*)data, len);
   }
 };
 
@@ -137,13 +160,11 @@ void register_new_master(const esp_now_recv_info_t *info, const uint8_t *data, i
   }
 }
 
-void ReconnectMQTTClient() 
-{
+void ReconnectMQTTClient() {
   Serial.print("Attempting MQTT ReConnection...");
 
   // Loop until we're reconnected
-  while (!mqttClient.connected()) 
-  {  
+  while (!mqttClient.connected()) {  
     mqttClient.setId(MQTT_CLIENT_ID);
 
     if (!mqttClient.connect(MQTT_BROKER_PATH, MQTT_BROKER_PORT)) 
@@ -166,7 +187,7 @@ void onEvent(arduino_event_id_t event) {
     case ARDUINO_EVENT_ETH_START:
       Serial.println("ETH Started");
       //set eth hostname here
-      ETH.setHostname("esp32-ethernet");
+      ETH.setHostname("ab-espnow-gw");
       break;
     case ARDUINO_EVENT_ETH_CONNECTED:
       Serial.println("ETH Connected");
@@ -201,9 +222,7 @@ void onEvent(arduino_event_id_t event) {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {
-    delay(10);
-  }
+  delay(1000);
 
   Network.onEvent(onEvent);
   while (ETH.begin() != true) {
@@ -253,30 +272,73 @@ void setup() {
   if (!mqttClient.connect(MQTT_BROKER_PATH, MQTT_BROKER_PORT)) {
     Serial.print("MQTT connection failed! Error code = ");
     Serial.println(mqttClient.connectError());
+    //while (1);
+  } else {
+      Serial.println("You're connected to the MQTT broker!");
+      Serial.println();
 
-    while (1);
+      // Allow the hardware to sort itself out
+      delay(5000);
   }
-  Serial.println("You're connected to the MQTT broker!");
-  Serial.println();
-
-  // Allow the hardware to sort itself out
-  delay(5000);
-
-  isStartupComplete = true;
 }
 
-void PublishDataToMQTTBroker(char *topic, char *macID, char *data)
-{
+void PublishDataToMQTTBroker(char *topic, char *data) {
     Serial.println("Sending Data To MQTT Broker");
     Serial.print("Topic: "); Serial.println(topic);
-    Serial.print("MACID: "); Serial.println(macID);
-    Serial.print("Data: ");  Serial.println(data);
     Serial.println();
 
     //send message, the Print interface can be used to set the message contents
     mqttClient.beginMessage(topic);
-    mqttClient.print(macID); mqttClient.print(" ::Data:: "); mqttClient.print(data);
+    mqttClient.print(data);
     mqttClient.endMessage();
+}
+
+void handleMeasurement(uint8_t measurement_type, float value) {
+    using namespace bthome_base;
+    uint8_t *p = (uint8_t *)&value;
+    switch (measurement_type)
+    {
+        case BTHOME_BUTTON_EVENT:
+        case BTHOME_DIMMER_EVENT:
+            {
+                char topic[MQTTTopicLength];
+                char message[MQTTDataLength];
+                JsonDocument jsonDoc;
+                String macString = String(currentSensorMac);
+                macString.replace(":", "");
+                bthome_measurement_event_record_t event_data{measurement_type, (uint8_t)((int)value & 0xff), (uint8_t)((int)value << 8 & 0xff)};
+                bthome_measurement_record_t data{.is_value = false, .d = {.event = event_data}};
+                Serial.printf("BTN/DIM Type %d value %f\n", measurement_type, value);
+                if (sensors.find(currentSensorMac) == sensors.end()) {
+                    sensors[currentSensorMac] = measurement_type;
+                    sprintf(topic, "homeassistant/sensor/%s/button/config", macString);
+                    jsonDoc["device"]["identifiers"] = macString;
+                    jsonDoc["state_topic"] = String("button/") + macString;
+                    jsonDoc["unique_id"] = String("button_") + macString;
+                    serializeJson(jsonDoc, message);
+                    PublishDataToMQTTBroker(topic, message);
+                    Serial.println("Init sensor");
+                }
+
+                uint8_t type = sensors[currentSensorMac];
+                //PublishDataToMQTTBroker(elem.Topic, elem.MacID, elem.Data);
+                break;
+            }
+        case BTHOME_PACKET_ID_VALUE:
+            //packet_id = value; // intentional fallthrough
+        default:
+            {
+                bthome_measurement_value_record_t value_data{measurement_type, value};
+                bthome_measurement_record_t data{.is_value = true, .d = {.value = value_data}};
+                Serial.printf("Type %d value %f\n", measurement_type, value);
+            }
+            break;
+    }
+}
+
+void handleLog(const char *message) {
+    Serial.print("parse log: ");
+    Serial.println(message);
 }
 
 void loop() {
@@ -290,14 +352,20 @@ void loop() {
         if (DataQueue.isEmpty ()) {
             mqttClient.poll();
         } else {
-            while (!DataQueue.isEmpty ())
-            {
+            while (!DataQueue.isEmpty ()) {
                 QueueElem_t elem;
                 elem = DataQueue.dequeue();
-                PublishDataToMQTTBroker(elem.Topic, elem.MacID, elem.Data);
+                strcpy(currentSensorMac, elem.MacID);
+                bthome_base::parse_payload_bthome(
+                    (uint8_t *)&elem.Data[5],
+                    elem.DataLen - 5,
+                    bthome_base::BTProtoVersion_BTHomeV2,
+                    handleMeasurement, 
+                    handleLog
+                );
             }
         }
     }
 
-    delay(10000);
+    delay(100);
 }
