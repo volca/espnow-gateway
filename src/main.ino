@@ -11,6 +11,7 @@
 */
 
 #ifndef ETH_PHY_TYPE
+//#define ETH_PHY_TYPE  ETH_PHY_IP101
 #define ETH_PHY_TYPE  ETH_PHY_LAN8720
 #define ETH_PHY_ADDR  1
 #define ETH_PHY_MDC   23
@@ -19,19 +20,23 @@
 #define ETH_CLK_MODE  ETH_CLOCK_GPIO17_OUT
 #endif
 
+#include <Arduino.h>
 #include "ESP32_NOW.h"
 #include "WiFi.h"
 #include "ETH.h"
 #include <ArduinoQueue.h>
 #include <ArduinoJson.h>
 #include <ArduinoMqttClient.h>
-
-#include <esp_mac.h>  // For the MAC2STR and MACSTR macros
+#include <ESPmDNS.h>
+#include <NetworkUdp.h>
+#include <ArduinoOTA.h>
+// For the MAC2STR and MACSTR macros
+#include <esp_mac.h>  
 
 #include <vector>
 #include <map>
 #include "bthome_base_common.h"
-#include <bthome_parser.h>
+#include "bthome_parser.h"
 
 /* Definitions */
 
@@ -41,6 +46,8 @@
 #define MACIDSTRINGLENGTH 18
 
 #define ESPNOW_WIFI_CHANNEL 1
+
+#define PAYLOAD_PRESS       "PRESS"       
 
 using namespace bthome_base;
 
@@ -161,7 +168,7 @@ void register_new_master(const esp_now_recv_info_t *info, const uint8_t *data, i
 }
 
 void ReconnectMQTTClient() {
-  Serial.print("Attempting MQTT ReConnection...");
+  Serial.println("Attempting MQTT ReConnection...");
 
   // Loop until we're reconnected
   while (!mqttClient.connected()) {  
@@ -181,6 +188,45 @@ void ReconnectMQTTClient() {
   Serial.println();
 }
 
+void startOta() {
+    ArduinoOTA.setHostname("espnow-gw");
+    Serial.print("Start OTA host - ");
+    Serial.println(ArduinoOTA.getHostname());
+    ArduinoOTA
+        .onStart([]() {
+          String type;
+          if (ArduinoOTA.getCommand() == U_FLASH) {
+            type = "sketch";
+          } else {  // U_SPIFFS
+            type = "filesystem";
+          }
+
+          // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+          Serial.println("Start updating " + type);
+        })
+        .onEnd([]() {
+          Serial.println("\nEnd");
+        })
+        .onProgress([](unsigned int progress, unsigned int total) {
+          Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+        })
+        .onError([](ota_error_t error) {
+          Serial.printf("Error[%u]: ", error);
+          if (error == OTA_AUTH_ERROR) {
+            Serial.println("Auth Failed");
+          } else if (error == OTA_BEGIN_ERROR) {
+            Serial.println("Begin Failed");
+          } else if (error == OTA_CONNECT_ERROR) {
+            Serial.println("Connect Failed");
+          } else if (error == OTA_RECEIVE_ERROR) {
+            Serial.println("Receive Failed");
+          } else if (error == OTA_END_ERROR) {
+            Serial.println("End Failed");
+          }
+        });
+
+  ArduinoOTA.begin();
+}
 
 void onEvent(arduino_event_id_t event) {
   switch (event) {
@@ -204,6 +250,7 @@ void onEvent(arduino_event_id_t event) {
       Serial.print(ETH.linkSpeed());
       Serial.println("Mbps");
       eth_connected = true;
+      startOta();
       break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       Serial.println("ETH Disconnected");
@@ -296,6 +343,7 @@ void PublishDataToMQTTBroker(char *topic, char *data) {
 void handleMeasurement(uint8_t measurement_type, float value) {
     using namespace bthome_base;
     uint8_t *p = (uint8_t *)&value;
+    Serial.printf("button evt %d\n", BTHOME_BUTTON_EVENT);
     switch (measurement_type)
     {
         case BTHOME_BUTTON_EVENT:
@@ -311,17 +359,21 @@ void handleMeasurement(uint8_t measurement_type, float value) {
                 Serial.printf("BTN/DIM Type %d value %f\n", measurement_type, value);
                 if (sensors.find(currentSensorMac) == sensors.end()) {
                     sensors[currentSensorMac] = measurement_type;
-                    sprintf(topic, "homeassistant/sensor/%s/button/config", macString);
+                    sprintf(topic, "homeassistant/binary_sensor/%s/config", macString);
                     jsonDoc["device"]["identifiers"] = macString;
-                    jsonDoc["state_topic"] = String("button/") + macString;
+                    jsonDoc["state_topic"] = String("home/button/") + macString + String("/state");
                     jsonDoc["unique_id"] = String("button_") + macString;
+                    jsonDoc["expire_after"] = 20;
                     serializeJson(jsonDoc, message);
                     PublishDataToMQTTBroker(topic, message);
                     Serial.println("Init sensor");
                 }
 
                 uint8_t type = sensors[currentSensorMac];
-                //PublishDataToMQTTBroker(elem.Topic, elem.MacID, elem.Data);
+                jsonDoc.clear();
+                sprintf(topic, "home/button/%s/state", macString);
+
+                PublishDataToMQTTBroker(topic, (char *)"ON");
                 break;
             }
         case BTHOME_PACKET_ID_VALUE:
@@ -342,30 +394,34 @@ void handleLog(const char *message) {
 }
 
 void loop() {
-    if (eth_connected) {
-        if (!mqttClient.connected()) {
-            Serial.println("Reconnect MQTT broker");
-            ReconnectMQTTClient();
-        }
+    if (!eth_connected) {
+        delay(10);
+        return;
+    }
+        
+    if (!mqttClient.connected()) {
+        Serial.println("Reconnect MQTT broker");
+        ReconnectMQTTClient();
+    }
 
-        // call poll() regularly to allow the library to send MQTT keep alives which avoids being disconnected by the broker
-        if (DataQueue.isEmpty ()) {
-            mqttClient.poll();
-        } else {
-            while (!DataQueue.isEmpty ()) {
-                QueueElem_t elem;
-                elem = DataQueue.dequeue();
-                strcpy(currentSensorMac, elem.MacID);
-                bthome_base::parse_payload_bthome(
-                    (uint8_t *)&elem.Data[5],
-                    elem.DataLen - 5,
-                    bthome_base::BTProtoVersion_BTHomeV2,
-                    handleMeasurement, 
-                    handleLog
-                );
-            }
+    // call poll() regularly to allow the library to send MQTT keep alives which avoids being disconnected by the broker
+    if (DataQueue.isEmpty ()) {
+        mqttClient.poll();
+    } else {
+        while (!DataQueue.isEmpty ()) {
+            QueueElem_t elem;
+            elem = DataQueue.dequeue();
+            strcpy(currentSensorMac, elem.MacID);
+            bthome_base::parse_payload_bthome(
+                (uint8_t *)&elem.Data[5],
+                elem.DataLen - 5,
+                bthome_base::BTProtoVersion_BTHomeV2,
+                handleMeasurement, 
+                handleLog
+            );
         }
     }
 
-    delay(100);
+    ArduinoOTA.handle();
+    delay(10);
 }
